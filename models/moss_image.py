@@ -1,12 +1,17 @@
+import math
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
+from collections import defaultdict
+
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from PIL import Image, ImageOps
 
-from models.base import ComfyPipeline, make_contiguous
+from models.base import ComfyPipeline, make_contiguous, maybe_pad
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
@@ -17,7 +22,16 @@ from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_atte
 import comfy.model_prefetch
 
 
-def attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_options, mask=None):
+def modulated_rms_norm_raw(x, norm):
+    # training path of modulated_rms_norm without the scale/shift
+    return norm(x)
+
+
+def attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_options, mask=None, isolate_split=None):
+    # isolate_split: with edit references, the sequence is [live | refs]; reference
+    # queries only attend to reference keys (ai-toolkit's kv_cache/isolate_refs mode).
+    # Two unmasked SDPA calls when there is no padding; otherwise a block mask that
+    # keeps reference queries on reference keys and lets live queries see everything.
     B, N, _ = q.shape
     dtype = v.dtype
     q = q.view(B, N, heads, -1)
@@ -30,6 +44,24 @@ def attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_o
         q, k = comfy.quant_ops.ck.rms_rope_split_half(q, k, pe, q_scale, k_scale, q_norm.eps)
         comfy.ops.uncast_bias_weight(q_norm, q_scale, None, q_stream)
         comfy.ops.uncast_bias_weight(k_norm, k_scale, None, k_stream)
+    if isolate_split is not None:
+        # mask arrives as (B, 1, 1, N) key validity
+        key_valid = mask.reshape(B, N)
+        if bool(key_valid.all()):
+            # no padding anywhere: isolation as two unmasked SDPA calls
+            q_live, q_ref = q[:, :isolate_split], q[:, isolate_split:]
+            k_live, k_ref = k[:, :isolate_split], k[:, isolate_split:]
+            v_live, v_ref = v[:, :isolate_split], v[:, isolate_split:]
+            out = torch.cat([
+                optimized_attention(AttentionTensorContainer(q_live.flatten(2)), AttentionTensorContainer(k_live.flatten(2)), AttentionTensorContainer(v_live), heads, mask=None, transformer_options=transformer_options, preferred_attention=comfy_attention),
+                optimized_attention(AttentionTensorContainer(q_ref.flatten(2)), AttentionTensorContainer(k_ref.flatten(2)), AttentionTensorContainer(v_ref), heads, mask=None, transformer_options=transformer_options, preferred_attention=comfy_attention),
+            ], dim=1)
+            return out
+        # some sample has padding: build an explicit block mask instead
+        is_ref = torch.arange(N, device=q.device) >= isolate_split
+        allowed = key_valid[:, None, :] & (~is_ref[:, None] | is_ref[None, :])[None]
+        allowed = allowed | torch.eye(N, dtype=torch.bool, device=q.device)
+        mask = allowed[:, None]
     q, k, v = AttentionTensorContainer(q.flatten(2)), AttentionTensorContainer(k.flatten(2)), AttentionTensorContainer(v)
     return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options, preferred_attention=comfy_attention)
 
@@ -95,20 +127,42 @@ class Block(nn.Module):
         self.proj["ffn_up_gate"] = operations.Linear(dim, 2 * ffn_dim, bias=False, dtype=dtype, device=device)
         self.proj["ffn_down"] = operations.Linear(ffn_dim, dim, bias=False, dtype=dtype, device=device)
 
-    def forward(self, x, mod, pe, mask, transformer_options={}):
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod
-        y = modulated_rms_norm(x, self.norm1, scale_a, shift_a)
+    def forward(self, x, mod, pe, mask, transformer_options={}, isolate_split=None):
+        # mod is (shift_a, scale_a, gate_a, shift_f, scale_f, gate_f), each (B, 1, D),
+        # or (mod, ref_mod, split) when edit references ride at t=0: tokens
+        # [split:] are clean reference latents modulated at timestep 0
+        if isinstance(mod, tuple):
+            mod, ref_mod, split = mod
+            m, r = mod, ref_mod
+
+            def affine(h, scale, shift):
+                return torch.cat(
+                    (h[:, :split] * (1 + m[scale]) + m[shift],
+                     h[:, split:] * (1 + r[scale]) + r[shift]), 1)
+
+            def gate(h, g):
+                return torch.cat((h[:, :split] * m[g], h[:, split:] * r[g]), 1)
+        else:
+            m = mod
+
+            def affine(h, scale, shift):
+                return h * (1 + m[scale]) + m[shift]
+
+            def gate(h, g):
+                return h * m[g]
+
+        y = affine(modulated_rms_norm_raw(x, self.norm1), 1, 0)
         if self.fused_qkv:
             q, k, v = self.proj["qkv"](y).chunk(3, dim=-1)
         else:
             q, k, v = self.proj["q"](y), self.proj["k"](y), self.proj["v"](y)
-        out = attention(q, k, v, self.q_norm, self.k_norm, pe, self.num_heads, self.comfy_attention, transformer_options, mask=mask)
-        x = gated_residual(x, self.proj["o"](out), gate_a)
-        y = modulated_rms_norm(x, self.norm2, scale_f, shift_f)
-        hidden, gate = self.proj["ffn_up_gate"](y).chunk(2, dim=-1)
+        out = attention(q, k, v, self.q_norm, self.k_norm, pe, self.num_heads, self.comfy_attention, transformer_options, mask=mask, isolate_split=isolate_split)
+        x = gated_residual(x, self.proj["o"](out), gate(m[2], 2))
+        y = affine(modulated_rms_norm_raw(x, self.norm2), 4, 3)
+        hidden, ffn_gate = self.proj["ffn_up_gate"](y).chunk(2, dim=-1)
         # situ without its 4 * 25 factor, applied on the gate instead (ffn_down has no bias): two fewer passes
-        out = self.proj["ffn_down"](torch.tanh(gate / 4.0) * torch.sigmoid(gate) * torch.tanh(hidden / 25.0))
-        return gated_residual(x, out, gate_f * 100.0)
+        out = self.proj["ffn_down"](torch.tanh(ffn_gate / 4.0) * torch.sigmoid(ffn_gate) * torch.tanh(hidden / 25.0))
+        return gated_residual(x, out, gate(m[5], 5) * 100.0)
 
 comfy.ldm.moss_image.model.Block = Block
 
@@ -121,10 +175,18 @@ class MossImagePipeline(ComfyPipeline):
     adapter_target_modules = ['Block', 'TextBlock']
     keep_in_high_precision = ['shared_block_modulation', 'text_embedder', 'time_embedding', 'video_embedder', 'final_linear_video', 'final_norm_video', 'rope.bands', 'video_head_modulation']
 
+    # ai-toolkit edit layout: references are prepended to the prompt as
+    # "Picture N: <vision>" and VLM-downscaled to <= vlm_image_size pixels
+    vlm_image_size = 384 * 384
+    # edit mode: references also ride the DiT as clean t=0 latents appended
+    # after the text, isolated so their K/V are step-invariant (kv_cache)
+    edit_mode = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.latent_format = comfy.latent_formats.Flux2()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.edit_mode = bool(self.model_config.get('edit_mode', False))
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
@@ -158,6 +220,105 @@ class MossImagePipeline(ComfyPipeline):
         assert text_embeds.shape[:2] == attention_mask.shape[:2]
         attention_mask = attention_mask.to(torch.bool)
         return text_embeds, attention_mask
+
+    def get_call_vae_fn(self, vae):
+        # edit mode: also encode the reference (control) image into control_latents
+        parent_vae_fn = super().get_call_vae_fn(vae)
+
+        def fn(*args):
+            if len(args) == 1:
+                return parent_vae_fn(args[0])
+            elif len(args) == 2:
+                tensor, control_tensor = args
+                result = parent_vae_fn(tensor)
+                control_result = parent_vae_fn(control_tensor)
+                result['control_latents'] = control_result['latents']
+                return result
+            else:
+                raise RuntimeError(f'Unexpected number of args: {len(args)}')
+        return fn
+
+    def load_image_for_vlm(self, path):
+        pil_img = Image.open(path)
+        height, width = pil_img.height, pil_img.width
+
+        if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
+            pil_img = pil_img.convert('RGBA')
+
+        # add white background for transparent images
+        if pil_img.mode == 'RGBA':
+            canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
+            canvas.alpha_composite(pil_img)
+            pil_img = canvas.convert('RGB')
+        else:
+            pil_img = pil_img.convert('RGB')
+
+        scale_factor = self.vlm_image_size / math.sqrt(height * width)
+        return ImageOps.scale(pil_img, scale_factor)
+
+    def get_call_text_encoder_fn(self, text_encoder):
+        # 3-arg signature opts this text encoder into receiving control_file
+        # (see DatasetManager.te_fn_requires_control_file)
+        te = text_encoder
+        tokenizer = getattr(te.tokenizer, te.tokenizer.clip)
+        original_min_length = tokenizer.min_length
+
+        def to_prompt(caption, images):
+            # the ai-toolkit edit layout: "Picture N: <vision>" blocks ahead of
+            # the prompt. MOSSImageTokenizer applies the chat template + think block.
+            if len(images) == 0:
+                return caption
+            vision_block = "<|vision_start|><|image_pad|><|vision_end|>"
+            prefix = "".join(f"Picture {i + 1}: {vision_block}\n" for i in range(len(images)))
+            return prefix + caption
+
+        @torch.inference_mode()
+        def fn(captions: list[str], is_video: list[bool], control_files: list[list[str]] | None):
+            assert not any(is_video)
+
+            images_per_caption = []
+            for i in range(len(captions)):
+                files = None if control_files is None else control_files[i]
+                images_per_caption.append([self.load_image_for_vlm(f) for f in files] if files else [])
+
+            # tokenize each caption separately: the vision blocks expand to
+            # different token counts per image set
+            all_token_lists = []
+            for caption, images in zip(captions, images_per_caption):
+                if len(images) == 0:
+                    tokens = te.tokenize(caption)
+                else:
+                    image_tensors = torch.stack([
+                        torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+                        for img in images
+                    ])
+                    tokens = te.tokenize(to_prompt(caption, images), images=[image_tensors[i:i + 1] for i in range(image_tensors.shape[0])])
+                all_token_lists.append(tokens[te.tokenizer.clip_name][0])
+
+            # no truncation: the image-pad runs must stay whole
+            tokenizer.min_length = None
+            max_length = max(len(t) for t in all_token_lists)
+            tokens_dict = defaultdict(list)
+            for token_list in all_token_lists:
+                maybe_pad(token_list, max_length, tokenizer)  # right-pad to the longest in the batch
+                tokens_dict[te.tokenizer.clip_name].append(token_list)
+
+            o = te.encode_from_tokens_scheduled(tokens_dict)
+
+            text_embeds = o[0][0].to(self.dtype)
+            extra = o[0][1]
+            if 'attention_mask' in extra:
+                attention_mask = extra['attention_mask']
+            else:
+                attention_mask = torch.ones(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
+
+            tokenizer.min_length = original_min_length
+            return {
+                'text_embeds_0': text_embeds,
+                'attention_mask_0': attention_mask,
+            }
+
+        return fn
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
@@ -200,7 +361,13 @@ class MossImagePipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = noise - latents
 
-        return (noisy_latents, t, *self.get_conds(inputs)), (target, mask)
+        # edit mode: clean t=0 reference latents ride after the text tokens
+        extra_inputs = ()
+        if self.edit_mode and 'control_latents' in inputs:
+            control_latents = inputs['control_latents'].float()
+            extra_inputs = (control_latents,)
+
+        return (noisy_latents, t, *self.get_conds(inputs)) + extra_inputs, (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model
@@ -248,11 +415,17 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        x, timestep, context, context_mask = inputs
+        if len(inputs) == 5:
+            # edit mode: the last input carries the clean t=0 reference latents
+            x, timestep, context, context_mask, ref_latents = inputs
+        else:
+            x, timestep, context, context_mask = inputs
+            ref_latents = None
 
         B, _, H, W = x.shape
         dtype, device = x.dtype, x.device
-        pe = self.rope(H, W, context.shape[1], device)
+        text_len = context.shape[1]
+        pe = self.rope(H, W, text_len, device)
 
         vec = self.time_embedding(timestep_embedding(timestep, 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
@@ -270,9 +443,41 @@ class InitialLayer(nn.Module):
             torch.ones((B, 1, 1, img_len), dtype=bool, device=device),
             text_mask,
         ], dim=-1)
+
+        isolate_split = None
+        if ref_latents is not None:
+            # clean reference latents (B, C, h_i, w_i) ride after the text at t=0.
+            # ai-toolkit RoPE: reference i sits on axis r = i + 1 with the live
+            # text length as its frame coordinate and its own centered grid.
+            ref_tokens, ref_pe = self.pack_ref_latents(ref_latents, context_mask, device, dtype)
+            x = torch.cat((x, self.video_embedder(ref_tokens)), dim=1)
+            pe = torch.cat((pe.expand(B, -1, -1, -1, -1, -1), ref_pe), dim=1)
+            ref_vec = self.time_embedding(timestep_embedding(torch.zeros_like(timestep), 256).to(dtype))
+            ref_mod = self.shared_block_modulation(ref_vec).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
+            mod = (mod, ref_mod, img_len + text_len)
+            sequence_mask = torch.cat((sequence_mask, torch.ones((B, 1, 1, ref_tokens.shape[1]), dtype=bool, device=device)), dim=-1)
+            isolate_split = img_len + text_len
+
         assert sequence_mask.shape[-1] == x.shape[1]
 
-        return make_contiguous(x, pe, sequence_mask, head_shift, head_scale, sizes, *mod)
+        return make_contiguous(x, pe, sequence_mask, head_shift, head_scale, sizes, isolate_split, *mod)
+
+    def pack_ref_latents(self, ref_latents, context_mask, device, dtype):
+        # (B, C, h, w) clean reference latents -> right-padded tokens (B, R, C)
+        # and RoPE (B, R, head_dim); every sample carries exactly one reference.
+        lengths = context_mask.sum(1)
+        tokens = [latent.flatten(2).transpose(0, 1).to(device, dtype) for latent in ref_latents]
+        num_ref = max(t.shape[0] for t in tokens)
+        tokens = torch.stack([F.pad(t, (0, 0, 0, num_ref - t.shape[0])) for t in tokens])
+        ids = torch.zeros(tokens.shape[0], num_ref, 4, device=device, dtype=torch.float32)
+        for i, latent in enumerate(ref_latents):
+            _, h, w = latent.shape
+            ids[i, :h * w, 0] = i + 1
+            ids[i, :h * w, 1] = lengths[i]
+            ids[i, :h * w, 2] = (torch.arange(h, device=device, dtype=torch.float32) - (h - 1) / 2).repeat_interleave(w)
+            ids[i, :h * w, 3] = (torch.arange(w, device=device, dtype=torch.float32) - (w - 1) / 2).repeat(h)
+        pe = self.pe_embedder(ids).transpose(1, 2).contiguous()
+        return tokens, pe.to(dtype)
 
 
 class TransformerLayer(nn.Module):
@@ -286,13 +491,13 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, pe, sequence_mask, head_shift, head_scale, sizes, *mod = inputs
+        x, pe, sequence_mask, head_shift, head_scale, sizes, isolate_split, *mod = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        x = self.layer(x, mod, pe, sequence_mask, self.transformer_options)
+        x = self.layer(x, mod, pe, sequence_mask, self.transformer_options, isolate_split=isolate_split)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(x, pe, sequence_mask, head_shift, head_scale, sizes, *mod)
+        return make_contiguous(x, pe, sequence_mask, head_shift, head_scale, sizes, isolate_split, *mod)
 
 
 class FinalLayer(nn.Module):
@@ -308,7 +513,7 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        x, pe, sequence_mask, head_shift, head_scale, sizes, *mod = inputs
+        x, pe, sequence_mask, head_shift, head_scale, sizes, isolate_split, *mod = inputs
         B = x.shape[0]
         H, W = sizes.tolist()
         out = self.final_linear_video(modulated_rms_norm(x[:, :H * W], self.final_norm_video, head_scale, head_shift))
