@@ -683,3 +683,20 @@ timestep_sample_method = 'logit_normal'
 shift = 3
 ```
 The int8-convrot format will NOT work right for training LoRAs. Loss just goes up sharply. I don't know why; it only happens on this model. You need the full bf16. `diffusion_model_dtype = 'float8'` probably works if you need the VRAM savings, but it will have some quality loss and I haven't tested it. All input models and saved models are in ComfyUI format.
+
+### Edit training (ai-toolkit compatible)
+Set `edit_mode = true` in the `[model]` section and use a dataset with `control_path` (see the [MOSS-Image edit example dataset config](../examples/moss_image_edit_dataset.toml)).
+```
+[model]
+type = 'moss_image'
+edit_mode = true
+diffusion_model = '/data2/imagegen_models/comfyui-models/moss_image_base_bf16.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/flux2-vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3.5_9b_int8_convrot.safetensors', type = 'moss_image'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+shift = 3
+```
+This trains edit LoRAs matching ai-toolkit's MOSS-Image edit training: each control image is prepended to the prompt as `Picture 1: <vision>` (downscaled to at most 384x384 pixels for the Qwen3.5 vision tower) and also encoded into clean t=0 reference latents that ride after the text tokens in the DiT. References attend only to themselves (kv_cache/isolate_refs), so their K/V are step-invariant — matching ComfyUI's `index_timestep_zero_isolated` edit format. Saved LoRAs load in ComfyUI with the `TextEncodeMOSSImageEdit` node using the `ai-toolkit` edit format.
